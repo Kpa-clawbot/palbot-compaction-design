@@ -28,12 +28,17 @@
   .callout { background: var(--surface); border-left: 4px solid var(--accent); padding: 1rem 1.25rem; border-radius: 0 8px 8px 0; margin-bottom: 1.5rem; }
   .callout.warn { border-left-color: var(--orange); }
   .callout.good { border-left-color: var(--green); }
+  .callout.resolved { border-left-color: var(--green); background: rgba(63,185,80,0.05); }
   .diagram { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.25rem; margin-bottom: 1.5rem; font-family: 'SFMono-Regular', Consolas, monospace; font-size: 0.85em; white-space: pre; overflow-x: auto; line-height: 1.5; }
   .tag { display: inline-block; padding: 0.15em 0.5em; border-radius: 12px; font-size: 0.8em; font-weight: 600; }
   .tag-new { background: rgba(63,185,80,0.15); color: var(--green); border: 1px solid rgba(63,185,80,0.3); }
   .tag-mod { background: rgba(210,153,34,0.15); color: var(--orange); border: 1px solid rgba(210,153,34,0.3); }
   .tag-unchanged { background: rgba(139,148,158,0.15); color: var(--muted); border: 1px solid rgba(139,148,158,0.3); }
+  .tag-resolved { background: rgba(63,185,80,0.15); color: var(--green); border: 1px solid rgba(63,185,80,0.3); }
+  .vs-table { margin: 1rem 0; }
+  .vs-table td:first-child { font-weight: 600; white-space: nowrap; }
   footer { margin-top: 3rem; padding-top: 1.5rem; border-top: 1px solid var(--border); color: var(--muted); font-size: 0.85rem; }
+  footer a { color: var(--accent); text-decoration: none; }
 </style>
 </head>
 <body>
@@ -74,10 +79,22 @@
 Compacted = summarized by Sonnet, cached in SQLite
 Raw = verbatim messages from Logger DB</div>
 
+<h3>Re-compaction Strategy: Full Re-summarization <span class="tag tag-resolved">decided</span></h3>
+
+<p>When re-compaction fires, it's a <strong>full re-summarization</strong> — not cumulative. The old summary is thrown away entirely, and Sonnet re-summarizes the full <code>compact_days</code> window from raw logs.</p>
+
+<div class="callout">
+  <strong>Why not cumulative?</strong> Cumulative summaries (feeding the old summary + new messages to produce an updated summary) drift over time. Each pass loses nuance, amplifies biases, and the summary gradually becomes a game of telephone. After a few cycles it'd be unrecognizable. Full re-summarization is more expensive per-compaction but keeps the summary grounded in actual messages.
+</div>
+
+<p><strong>Cost is manageable:</strong> Re-compaction only fires when the raw window exceeds <code>recompact_raw_hours</code> (default 12h). In a moderately active channel, that's maybe once or twice a day. One Sonnet call per re-compaction is cheap.</p>
+
 <h3>Re-compaction Trigger</h3>
 <p>As time passes, the raw window grows. When it exceeds a threshold (e.g. double <code>raw_hours</code> or a token limit), re-compaction fires:</p>
 <ol>
-  <li>Everything except the last <code>raw_hours</code> gets summarized</li>
+  <li>Pull the full <code>compact_days</code> window from Logger SQLite</li>
+  <li>Split at <code>raw_hours</code> boundary</li>
+  <li>Send the older portion to <code>compact_model</code> for <strong>fresh</strong> summarization (old summary discarded)</li>
   <li>New summary replaces the old one in cache</li>
   <li>Raw window shrinks back to <code>raw_hours</code></li>
 </ol>
@@ -116,6 +133,7 @@ CREATE TABLE settings (
   <tr><td><code>raw_hours</code></td><td>6</td><td>Minimum hours of uncompacted recent messages</td></tr>
   <tr><td><code>compact_max_tokens</code></td><td>2000</td><td>Target max size for compacted summary</td></tr>
   <tr><td><code>recompact_raw_hours</code></td><td>12</td><td>Raw window size that triggers re-compaction</td></tr>
+  <tr><td><code>search_max_tokens</code></td><td>8000</td><td>Max tokens for web search results (<code>!sclai</code> only)</td></tr>
 </table>
 
 <h3>Model Settings</h3>
@@ -127,12 +145,30 @@ CREATE TABLE settings (
 
 <p>Settings are per-channel (with guild-wide fallback). Stored in <code>ai_cache.db</code>.</p>
 
+<h2>Web Search Token Budget (<code>!sclai</code>) <span class="tag tag-resolved">decided</span></h2>
+
+<p>Search results are appended after the raw messages but <strong>count toward the total context budget</strong>. Without a cap, a broad search query could dump 20k+ tokens of web content, dwarfing the conversation context.</p>
+
+<p><strong>How it works:</strong></p>
+<ol>
+  <li>Web search runs and collects results as before</li>
+  <li>Results are truncated to <code>search_max_tokens</code> (default 8000, ~2-3 full page extracts)</li>
+  <li>If results exceed the cap, they're trimmed from the bottom (least relevant results dropped first)</li>
+  <li>The truncated results are appended to the context as <code>[Web Search Results]</code> block</li>
+</ol>
+
+<p><strong>Tuning:</strong> <code>!claiconfig search_max_tokens 5000</code> to tighten, or <code>12000</code> if you want more web context. The default of 8000 tokens (~6k words) is enough for most queries without blowing up costs.</p>
+
+<div class="callout">
+  <strong>Note:</strong> Search results are ephemeral — they're NOT included in compaction. Only the bot's answer (which synthesizes the search) gets logged and eventually compacted.
+</div>
+
 <h2>Commands</h2>
 
 <h3>Existing <span class="tag tag-mod">modified</span></h3>
 <ul>
   <li><code>!clai &lt;question&gt;</code> — Now uses compacted context + raw window instead of flat 24h dump</li>
-  <li><code>!sclai &lt;question&gt;</code> — Same, plus web search results appended</li>
+  <li><code>!sclai &lt;question&gt;</code> — Same, plus web search results appended (capped at <code>search_max_tokens</code>)</li>
 </ul>
 
 <h3>New <span class="tag tag-new">new</span></h3>
@@ -142,11 +178,37 @@ CREATE TABLE settings (
   <li><code>!claireset</code> — Blow away compaction cache for this channel (next call rebuilds)</li>
   <li><code>!claireset all</code> — Nuke entire cache DB</li>
   <li><code>!claistatus</code> — Show cache state: age, messages covered, raw window size, model info</li>
+  <li><code>!claicompact</code> — Force re-compaction now (see below)</li>
 </ul>
 
 <div class="callout warn">
   All config/admin commands are <code>@commands.is_owner()</code> only.
 </div>
+
+<h3><code>!claicompact</code> — Manual Re-compaction <span class="tag tag-resolved">decided</span></h3>
+
+<p>Forces an immediate re-compaction regardless of whether the raw window has exceeded the threshold. Useful for:</p>
+<ul>
+  <li><strong>After a big topic shift</strong> — the old summary is about yesterday's drama, but the channel has moved on. Force a fresh summary so Claude isn't confused by stale context.</li>
+  <li><strong>After changing settings</strong> — apply new <code>compact_days</code> or <code>compact_max_tokens</code> immediately instead of waiting for the natural trigger.</li>
+  <li><strong>Debugging</strong> — "the bot is acting weird, let me nuke and rebuild the summary."</li>
+</ul>
+
+<p><strong>Flow:</strong></p>
+<ol>
+  <li>Pull full <code>compact_days</code> window from Logger SQLite</li>
+  <li>Full re-summarization via <code>compact_model</code> (same as automatic re-compaction)</li>
+  <li>Replace cached summary, reset raw window boundary</li>
+  <li>Reply with confirmation: summary token count, messages covered, time range</li>
+</ol>
+
+<h4><code>!claicompact</code> vs <code>!claireset</code></h4>
+<table class="vs-table">
+  <tr><th></th><th><code>!claireset</code></th><th><code>!claicompact</code></th></tr>
+  <tr><td>Action</td><td>Deletes cache</td><td>Rebuilds cache <strong>now</strong></td></tr>
+  <tr><td>Next <code>!clai</code></td><td>Cold start (slow)</td><td>Warm cache (fast)</td></tr>
+  <tr><td>Use case</td><td>Nuclear option</td><td>Proactive refresh</td></tr>
+</table>
 
 <h2>Flow</h2>
 
@@ -167,7 +229,7 @@ CREATE TABLE settings (
   <li>Check if raw portion exceeds <code>recompact_raw_hours</code> threshold
     <ul>
       <li><strong>If no:</strong> Send to <code>answer_model</code>: system prompt + cached summary + raw messages + question</li>
-      <li><strong>If yes:</strong> Re-compact first (same as first call flow), then answer</li>
+      <li><strong>If yes:</strong> Re-compact first (full re-summarization), then answer</li>
     </ul>
   </li>
 </ol>
@@ -175,6 +237,7 @@ CREATE TABLE settings (
 <h3>Cache Invalidation</h3>
 <ul>
   <li><code>!claireset</code> — manual nuke</li>
+  <li><code>!claicompact</code> — manual rebuild</li>
   <li>Re-compaction — automatic when raw window grows too large</li>
   <li>Cache is keyed by <code>channel_id</code> — each channel is independent</li>
 </ul>
@@ -193,6 +256,9 @@ Omit:
 
 Keep the summary under {compact_max_tokens} tokens.</code></pre>
 
+<h2>Token Counting</h2>
+<p>Use a simple heuristic: <code>len(text) / 4</code> for approximate token count. No need for a tokenizer dependency — we're setting thresholds, not doing exact math.</p>
+
 <h2>What Doesn't Change <span class="tag tag-unchanged">unchanged</span></h2>
 <ul>
   <li><code>!ai</code> and <code>!sai</code> (Gemini commands)</li>
@@ -206,22 +272,33 @@ Keep the summary under {compact_max_tokens} tokens.</code></pre>
 <ol>
   <li>Add <code>ai_cache.py</code> helper module (DB init, cache CRUD, settings CRUD)</li>
   <li>Modify <code>!clai</code> in <code>gemini.py</code> to use compacted context</li>
-  <li>Modify <code>!sclai</code> similarly</li>
-  <li>Add <code>!claiconfig</code>, <code>!claireset</code>, <code>!claistatus</code> commands</li>
+  <li>Modify <code>!sclai</code> similarly (with <code>search_max_tokens</code> cap)</li>
+  <li>Add <code>!claiconfig</code>, <code>!claireset</code>, <code>!claistatus</code>, <code>!claicompact</code> commands</li>
   <li>Test on a quiet channel first, then busy ones</li>
 </ol>
 
-<h2>Open Questions</h2>
-<div class="callout">
-  <ul style="margin-bottom:0">
-    <li>Should compaction summaries be <strong>cumulative</strong> (new summary builds on old summary + new messages) or <strong>full re-summarization</strong> each time?</li>
-    <li>Should <code>!sclai</code> web search results count toward token thresholds?</li>
-    <li>Worth adding a <code>!claicompact</code> command to manually trigger re-compaction without waiting for threshold?</li>
-  </ul>
-</div>
+<h2>Resolved Decisions <span class="tag tag-resolved">resolved</span></h2>
+<table>
+  <tr><th>Question</th><th>Decision</th><th>Rationale</th></tr>
+  <tr>
+    <td>Cumulative vs full re-summarization?</td>
+    <td><strong>Full re-summarization</strong></td>
+    <td>Cumulative drifts over time — game of telephone. Full is grounded in actual messages. Cost is minimal (one Sonnet call per re-compaction).</td>
+  </tr>
+  <tr>
+    <td>Search results count toward thresholds?</td>
+    <td><strong>Capped separately</strong></td>
+    <td>New <code>search_max_tokens</code> setting (default 8000). Results truncated before appending. Not included in compaction — only the bot's synthesized answer persists.</td>
+  </tr>
+  <tr>
+    <td>Manual <code>!claicompact</code> command?</td>
+    <td><strong>Yes</strong></td>
+    <td>Rebuilds cache immediately (unlike <code>!claireset</code> which just nukes and waits). Useful after topic shifts, config changes, or debugging.</td>
+  </tr>
+</table>
 
 <footer>
-  Generated from <a href="https://github.com/iamsix/palbot" style="color:var(--accent)">iamsix/palbot</a> design notes.
+  Generated from <a href="https://github.com/iamsix/palbot">iamsix/palbot</a> design notes &middot; Updated Feb 8, 2026
 </footer>
 
 </body>
