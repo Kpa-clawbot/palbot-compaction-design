@@ -174,7 +174,8 @@ CREATE TABLE settings (
   <li><code>!claiconfig &lt;key&gt; &lt;value&gt;</code> — Change a setting</li>
   <li><code>!claireset</code> — Nuke cache and immediately rebuild (see below)</li>
   <li><code>!claireset all</code> — Nuke entire cache DB and rebuild all channels on next use</li>
-  <li><code>!claistatus</code> — Show cache state: age, messages covered, raw window size, model info</li>
+  <li><code>!claistatus</code> — Server-wide usage stats + per-channel cache summary</li>
+  <li><code>!claistatus #channel</code> — Detailed view for a specific channel</li>
 </ul>
 
 <div class="callout warn">
@@ -200,6 +201,53 @@ CREATE TABLE settings (
   <li>After changing <code>compact_days</code> or <code>compact_max_tokens</code> — apply immediately</li>
   <li>Debugging — "the bot is acting weird"</li>
 </ul>
+
+<h3><code>!claistatus</code> — Usage Stats</h3>
+
+<p>Every <code>!clai</code>, <code>!sclai</code>, and compaction call is logged to a <code>usage_log</code> table. <code>!claistatus</code> aggregates across all channels.</p>
+
+<p><strong>Server-wide view (<code>!claistatus</code>):</strong></p>
+<pre><code>📊 Claude AI Stats
+
+Cache: 3 channels active
+  #general: warm (2h ago) | #shitpost: warm (5h ago) | #dev: cold
+
+Usage (last 7d / all time):
+  !clai:   23 / 156 calls  |  142K / 891K tokens  |  $4.07 / $28.41
+  !sclai:   8 /  42 calls  |   89K / 470K tokens  |  $2.73 / $15.20
+  Compactions: 4 / 31       |   31K / 198K tokens  |  $0.19 / $1.22
+  ─────────────────────────────────────────────────────────────
+  Total:   35 / 229 calls  |  262K / 1.56M tokens  |  $6.99 / $44.83</code></pre>
+
+<p><strong>Per-channel view (<code>!claistatus #general</code>):</strong></p>
+<pre><code>📊 Claude AI Stats — #general
+
+Cache: warm (built 2h ago)
+  Summary: 1,847 tokens covering 6.2 days
+  Raw window: 8.1 hours (297 messages)
+  Next re-compaction: ~3.9h
+
+Usage (last 7d / all time):
+  !clai:  14 / 89 calls  |  98K / 612K tokens  |  $2.81 / $19.53
+  !sclai:  5 / 28 calls  |  61K / 340K tokens  |  $1.87 / $11.02
+  Compactions: 2 / 18     |  19K / 122K tokens  |  $0.12 / $0.75
+  ─────────────────────────────────────────────────────────────
+  Total:  21 / 135 calls  | 178K / 1.07M tokens  |  $4.80 / $31.30</code></pre>
+
+<p><strong>Storage:</strong></p>
+<pre><code>CREATE TABLE usage_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_id INTEGER NOT NULL,
+    guild_id INTEGER NOT NULL,
+    command TEXT NOT NULL,          -- 'clai', 'sclai', 'compaction'
+    input_tokens INTEGER NOT NULL,
+    output_tokens INTEGER NOT NULL,
+    cost_usd REAL,
+    model TEXT NOT NULL,
+    timestamp REAL NOT NULL
+);</code></pre>
+
+<p>Every API call logs a row. Cost is calculated from hardcoded model pricing (Opus for answers, Sonnet for compaction). Token counts come from the API response <code>usage</code> field.</p>
 
 <h2>Flow</h2>
 
