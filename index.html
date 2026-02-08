@@ -28,15 +28,12 @@
   .callout { background: var(--surface); border-left: 4px solid var(--accent); padding: 1rem 1.25rem; border-radius: 0 8px 8px 0; margin-bottom: 1.5rem; }
   .callout.warn { border-left-color: var(--orange); }
   .callout.good { border-left-color: var(--green); }
-  .callout.resolved { border-left-color: var(--green); background: rgba(63,185,80,0.05); }
   .diagram { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.25rem; margin-bottom: 1.5rem; font-family: 'SFMono-Regular', Consolas, monospace; font-size: 0.85em; white-space: pre; overflow-x: auto; line-height: 1.5; }
   .tag { display: inline-block; padding: 0.15em 0.5em; border-radius: 12px; font-size: 0.8em; font-weight: 600; }
   .tag-new { background: rgba(63,185,80,0.15); color: var(--green); border: 1px solid rgba(63,185,80,0.3); }
   .tag-mod { background: rgba(210,153,34,0.15); color: var(--orange); border: 1px solid rgba(210,153,34,0.3); }
   .tag-unchanged { background: rgba(139,148,158,0.15); color: var(--muted); border: 1px solid rgba(139,148,158,0.3); }
   .tag-resolved { background: rgba(63,185,80,0.15); color: var(--green); border: 1px solid rgba(63,185,80,0.3); }
-  .vs-table { margin: 1rem 0; }
-  .vs-table td:first-child { font-weight: 600; white-space: nowrap; }
   footer { margin-top: 3rem; padding-top: 1.5rem; border-top: 1px solid var(--border); color: var(--muted); font-size: 0.85rem; }
   footer a { color: var(--accent); text-decoration: none; }
 </style>
@@ -175,40 +172,34 @@ CREATE TABLE settings (
 <ul>
   <li><code>!claiconfig</code> — Show all current settings for this channel</li>
   <li><code>!claiconfig &lt;key&gt; &lt;value&gt;</code> — Change a setting</li>
-  <li><code>!claireset</code> — Blow away compaction cache for this channel (next call rebuilds)</li>
-  <li><code>!claireset all</code> — Nuke entire cache DB</li>
+  <li><code>!claireset</code> — Nuke cache and immediately rebuild (see below)</li>
+  <li><code>!claireset all</code> — Nuke entire cache DB and rebuild all channels on next use</li>
   <li><code>!claistatus</code> — Show cache state: age, messages covered, raw window size, model info</li>
-  <li><code>!claicompact</code> — Force re-compaction now (see below)</li>
 </ul>
 
 <div class="callout warn">
   All config/admin commands are <code>@commands.is_owner()</code> only.
 </div>
 
-<h3><code>!claicompact</code> — Manual Re-compaction <span class="tag tag-resolved">decided</span></h3>
+<h3><code>!claireset</code> — Nuke &amp; Rebuild</h3>
 
-<p>Forces an immediate re-compaction regardless of whether the raw window has exceeded the threshold. Useful for:</p>
-<ul>
-  <li><strong>After a big topic shift</strong> — the old summary is about yesterday's drama, but the channel has moved on. Force a fresh summary so Claude isn't confused by stale context.</li>
-  <li><strong>After changing settings</strong> — apply new <code>compact_days</code> or <code>compact_max_tokens</code> immediately instead of waiting for the natural trigger.</li>
-  <li><strong>Debugging</strong> — "the bot is acting weird, let me nuke and rebuild the summary."</li>
-</ul>
+<p>Blows away the existing compaction cache for this channel and immediately rebuilds it. Not a lazy invalidation — it does the Sonnet call right now so the next <code>!clai</code> hits a warm cache.</p>
 
 <p><strong>Flow:</strong></p>
 <ol>
+  <li>Delete existing cache entry for this channel</li>
   <li>Pull full <code>compact_days</code> window from Logger SQLite</li>
-  <li>Full re-summarization via <code>compact_model</code> (same as automatic re-compaction)</li>
-  <li>Replace cached summary, reset raw window boundary</li>
+  <li>Summarize everything except the last <code>raw_hours</code> via <code>compact_model</code></li>
+  <li>Store fresh summary, set boundary at <code>now - raw_hours</code></li>
   <li>Reply with confirmation: summary token count, messages covered, time range</li>
 </ol>
 
-<h4><code>!claicompact</code> vs <code>!claireset</code></h4>
-<table class="vs-table">
-  <tr><th></th><th><code>!claireset</code></th><th><code>!claicompact</code></th></tr>
-  <tr><td>Action</td><td>Deletes cache</td><td>Rebuilds cache <strong>now</strong></td></tr>
-  <tr><td>Next <code>!clai</code></td><td>Cold start (slow)</td><td>Warm cache (fast)</td></tr>
-  <tr><td>Use case</td><td>Nuclear option</td><td>Proactive refresh</td></tr>
-</table>
+<p><strong>When to use:</strong></p>
+<ul>
+  <li>After a big topic shift — stale summary is confusing Claude</li>
+  <li>After changing <code>compact_days</code> or <code>compact_max_tokens</code> — apply immediately</li>
+  <li>Debugging — "the bot is acting weird"</li>
+</ul>
 
 <h2>Flow</h2>
 
@@ -236,8 +227,7 @@ CREATE TABLE settings (
 
 <h3>Cache Invalidation</h3>
 <ul>
-  <li><code>!claireset</code> — manual nuke</li>
-  <li><code>!claicompact</code> — manual rebuild</li>
+  <li><code>!claireset</code> — nuke and immediate rebuild</li>
   <li>Re-compaction — automatic when raw window grows too large</li>
   <li>Cache is keyed by <code>channel_id</code> — each channel is independent</li>
 </ul>
@@ -273,7 +263,7 @@ Keep the summary under {compact_max_tokens} tokens.</code></pre>
   <li>Add <code>ai_cache.py</code> helper module (DB init, cache CRUD, settings CRUD)</li>
   <li>Modify <code>!clai</code> in <code>gemini.py</code> to use compacted context</li>
   <li>Modify <code>!sclai</code> similarly (with <code>search_max_tokens</code> cap)</li>
-  <li>Add <code>!claiconfig</code>, <code>!claireset</code>, <code>!claistatus</code>, <code>!claicompact</code> commands</li>
+  <li>Add <code>!claiconfig</code>, <code>!claireset</code>, <code>!claistatus</code> commands</li>
   <li>Test on a quiet channel first, then busy ones</li>
 </ol>
 
@@ -291,9 +281,9 @@ Keep the summary under {compact_max_tokens} tokens.</code></pre>
     <td>New <code>search_max_tokens</code> setting (default 8000). Results truncated before appending. Not included in compaction — only the bot's synthesized answer persists.</td>
   </tr>
   <tr>
-    <td>Manual <code>!claicompact</code> command?</td>
-    <td><strong>Yes</strong></td>
-    <td>Rebuilds cache immediately (unlike <code>!claireset</code> which just nukes and waits). Useful after topic shifts, config changes, or debugging.</td>
+    <td>Separate <code>!claicompact</code> command?</td>
+    <td><strong>Merged into <code>!claireset</code></strong></td>
+    <td>Originally separate, but it was just <code>!claireset</code> + immediate rebuild. Simpler to have one command that always nukes and rebuilds. No reason to leave a cold cache.</td>
   </tr>
 </table>
 
