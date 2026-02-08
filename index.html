@@ -111,7 +111,7 @@ Raw = verbatim messages from Logger DB</div>
 <h3>Error Handling</h3>
 <p>If the compaction API call fails (Sonnet timeout, rate limit, network error):</p>
 <ul>
-  <li><strong>During <code>!claireset</code>:</strong> Reply with the error. Cache stays deleted. Admin can retry.</li>
+  <li><strong>During <code>!claireset</code>:</strong> Reply with the error message and advise retrying <code>!claireset</code>. Cache stays deleted (cold) until rebuild succeeds.</li>
   <li><strong>During auto re-compaction:</strong> Log the error, keep the old cache, skip compaction this round. Next <code>!clai</code> call will try again. The raw window keeps growing until compaction succeeds.</li>
   <li><strong>During cold start:</strong> Reply with just the raw messages (no summary). Log the error. Next call retries.</li>
 </ul>
@@ -166,6 +166,19 @@ CREATE TABLE settings (
 </table>
 
 <p>Settings are per-channel (with guild-wide fallback). Stored in <code>ai_cache.db</code>.</p>
+
+<h3>Validation</h3>
+<p>Settings are validated on write. Sensible bounds:</p>
+<table>
+  <tr><th>Key</th><th>Min</th><th>Max</th></tr>
+  <tr><td><code>compact_days</code></td><td>1</td><td>30</td></tr>
+  <tr><td><code>raw_hours</code></td><td>1</td><td>48</td></tr>
+  <tr><td><code>compact_max_tokens</code></td><td>500</td><td>10000</td></tr>
+  <tr><td><code>recompact_raw_hours</code></td><td>2</td><td>72</td></tr>
+  <tr><td><code>recompact_raw_tokens</code></td><td>2000</td><td>100000</td></tr>
+  <tr><td><code>search_max_tokens</code></td><td>1000</td><td>50000</td></tr>
+</table>
+<p>Invalid values get rejected with an error message showing the allowed range.</p>
 
 <h2>Web Search Token Budget (<code>!sclai</code>) <span class="tag tag-resolved">decided</span></h2>
 
@@ -280,7 +293,8 @@ Usage (last 7d / all time):
 <ol>
   <li>Check <code>ai_cache.db</code> for this channel — nothing there</li>
   <li>Pull last <code>compact_days</code> of messages from Logger SQLite</li>
-  <li>Split at <code>raw_hours</code> boundary</li>
+  <li>If total messages fit within <code>compact_max_tokens</code>, skip compaction — send everything raw</li>
+  <li>Otherwise, split at <code>raw_hours</code> boundary</li>
   <li>Send older portion to <code>compact_model</code> with summarization prompt</li>
   <li>Store summary in <code>compaction_cache</code> table</li>
   <li>Send to <code>answer_model</code>: system prompt + summary + raw messages + question</li>
@@ -319,6 +333,10 @@ Omit:
 - Messages with no informational value
 
 Keep the summary under {compact_max_tokens} tokens.</code></pre>
+
+<div class="callout">
+  <strong>Note:</strong> The <code>[BOT]</code> marker should match however palbot currently labels its own messages in the log. Check <code>get_messages_for_ai()</code> during implementation.
+</div>
 
 <h2>Token Counting</h2>
 <p>Use a simple heuristic: <code>len(text) / 4</code> for approximate token count. No need for a tokenizer dependency — we're setting thresholds, not doing exact math.</p>
