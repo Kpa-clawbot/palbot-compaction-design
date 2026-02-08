@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Palbot Context Compaction — Design Doc</title>
+<style>
+  :root { --bg: #0d1117; --surface: #161b22; --border: #30363d; --text: #e6edf3; --muted: #8b949e; --accent: #58a6ff; --green: #3fb950; --orange: #d29922; --red: #f85149; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); line-height: 1.6; padding: 2rem; max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 2rem; margin-bottom: 0.25rem; }
+  h2 { font-size: 1.4rem; margin-top: 2.5rem; margin-bottom: 1rem; padding-bottom: 0.5rem; border-bottom: 1px solid var(--border); color: var(--accent); }
+  h3 { font-size: 1.1rem; margin-top: 1.5rem; margin-bottom: 0.75rem; color: var(--text); }
+  p { margin-bottom: 1rem; }
+  .subtitle { color: var(--muted); margin-bottom: 2rem; font-size: 0.95rem; }
+  .subtitle a { color: var(--accent); text-decoration: none; }
+  .subtitle a:hover { text-decoration: underline; }
+  ul, ol { margin-bottom: 1rem; padding-left: 1.5rem; }
+  li { margin-bottom: 0.4rem; }
+  code { font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace; background: var(--surface); padding: 0.2em 0.4em; border-radius: 4px; font-size: 0.9em; border: 1px solid var(--border); }
+  pre { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1rem; overflow-x: auto; margin-bottom: 1rem; }
+  pre code { background: none; border: none; padding: 0; font-size: 0.85em; }
+  table { width: 100%; border-collapse: collapse; margin-bottom: 1rem; }
+  th, td { text-align: left; padding: 0.6rem 1rem; border: 1px solid var(--border); }
+  th { background: var(--surface); color: var(--accent); font-weight: 600; }
+  td { background: var(--bg); }
+  strong { color: #f0f6fc; }
+  .callout { background: var(--surface); border-left: 4px solid var(--accent); padding: 1rem 1.25rem; border-radius: 0 8px 8px 0; margin-bottom: 1.5rem; }
+  .callout.warn { border-left-color: var(--orange); }
+  .callout.good { border-left-color: var(--green); }
+  .diagram { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.25rem; margin-bottom: 1.5rem; font-family: 'SFMono-Regular', Consolas, monospace; font-size: 0.85em; white-space: pre; overflow-x: auto; line-height: 1.5; }
+  .tag { display: inline-block; padding: 0.15em 0.5em; border-radius: 12px; font-size: 0.8em; font-weight: 600; }
+  .tag-new { background: rgba(63,185,80,0.15); color: var(--green); border: 1px solid rgba(63,185,80,0.3); }
+  .tag-mod { background: rgba(210,153,34,0.15); color: var(--orange); border: 1px solid rgba(210,153,34,0.3); }
+  .tag-unchanged { background: rgba(139,148,158,0.15); color: var(--muted); border: 1px solid rgba(139,148,158,0.3); }
+  footer { margin-top: 3rem; padding-top: 1.5rem; border-top: 1px solid var(--border); color: var(--muted); font-size: 0.85rem; }
+</style>
+</head>
+<body>
+
+<h1>Palbot Context Compaction</h1>
+<p class="subtitle">
+  Design doc for <a href="https://github.com/iamsix/palbot">iamsix/palbot</a> &middot; <code>modules/gemini.py</code><br>
+  Authors: Iavor + Stinkmeaner &middot; February 2026
+</p>
+
+<h2>Problem</h2>
+<p><code>!clai</code> and <code>!sclai</code> are stateless — every call dumps up to 24 hours of raw channel history from SQLite into a single Claude API call. This works but:</p>
+<ul>
+  <li><strong>Wasteful:</strong> Re-sends entire 24h log every time</li>
+  <li><strong>No long-term memory:</strong> Anything older than 24h is gone</li>
+  <li><strong>Scales poorly:</strong> Busy channels = massive context = expensive calls</li>
+  <li><strong>No tuning:</strong> Hardcoded 24h window, no way to adjust at runtime</li>
+</ul>
+
+<h2>Solution</h2>
+<p>Add a compaction layer between SQLite log retrieval and the Claude API call. Recent messages stay raw; older messages get summarized by a cheaper model and cached.</p>
+
+<div class="callout good">
+  <strong>Key insight:</strong> The raw window <em>stretches</em> back to meet the compaction boundary — there are never gaps between compacted and raw context.
+</div>
+
+<h2>Architecture</h2>
+<p>The context sent to Claude will look like:</p>
+<pre><code>[System prompt]
+[Compacted summary: last N days, excluding recent window]
+[Raw messages: from compaction boundary through now — minimum X hours]
+[User's question + any web search results (sclai only)]</code></pre>
+
+<h3>Context Window Diagram</h3>
+<div class="diagram">Day -7          Compaction boundary          Now
+|--- compacted summary ---|--- raw (stretches) ---|
+
+Compacted = summarized by Sonnet, cached in SQLite
+Raw = verbatim messages from Logger DB</div>
+
+<h3>Re-compaction Trigger</h3>
+<p>As time passes, the raw window grows. When it exceeds a threshold (e.g. double <code>raw_hours</code> or a token limit), re-compaction fires:</p>
+<ol>
+  <li>Everything except the last <code>raw_hours</code> gets summarized</li>
+  <li>New summary replaces the old one in cache</li>
+  <li>Raw window shrinks back to <code>raw_hours</code></li>
+</ol>
+
+<h2>Storage</h2>
+<p>New SQLite database created on first run at <code>logfiles/ai_cache.db</code>. Separate from the Logger DB (which has years of data and shouldn't be touched).</p>
+
+<h3>Tables</h3>
+<pre><code>CREATE TABLE compaction_cache (
+    channel_id INTEGER PRIMARY KEY,
+    guild_id INTEGER NOT NULL,
+    oldest_snowflake INTEGER NOT NULL,   -- start of compacted range
+    newest_snowflake INTEGER NOT NULL,   -- end of compacted range
+    summary_text TEXT NOT NULL,
+    model_used TEXT NOT NULL,
+    token_count INTEGER,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE TABLE settings (
+    guild_id INTEGER,
+    channel_id INTEGER,                  -- NULL = guild-wide default
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (guild_id, channel_id, key)
+);</code></pre>
+
+<h2>Configurable Settings</h2>
+
+<h3>Context Settings</h3>
+<table>
+  <tr><th>Key</th><th>Default</th><th>Description</th></tr>
+  <tr><td><code>compact_days</code></td><td>7</td><td>How many days back to pull for compaction</td></tr>
+  <tr><td><code>raw_hours</code></td><td>6</td><td>Minimum hours of uncompacted recent messages</td></tr>
+  <tr><td><code>compact_max_tokens</code></td><td>2000</td><td>Target max size for compacted summary</td></tr>
+  <tr><td><code>recompact_raw_hours</code></td><td>12</td><td>Raw window size that triggers re-compaction</td></tr>
+</table>
+
+<h3>Model Settings</h3>
+<table>
+  <tr><th>Key</th><th>Default</th><th>Description</th></tr>
+  <tr><td><code>answer_model</code></td><td><code>claude-opus-4.6</code></td><td>Model for <code>!clai</code>/<code>!sclai</code> responses</td></tr>
+  <tr><td><code>compact_model</code></td><td><code>claude-sonnet-4.5</code></td><td>Model for summarization</td></tr>
+</table>
+
+<p>Settings are per-channel (with guild-wide fallback). Stored in <code>ai_cache.db</code>.</p>
+
+<h2>Commands</h2>
+
+<h3>Existing <span class="tag tag-mod">modified</span></h3>
+<ul>
+  <li><code>!clai &lt;question&gt;</code> — Now uses compacted context + raw window instead of flat 24h dump</li>
+  <li><code>!sclai &lt;question&gt;</code> — Same, plus web search results appended</li>
+</ul>
+
+<h3>New <span class="tag tag-new">new</span></h3>
+<ul>
+  <li><code>!claiconfig</code> — Show all current settings for this channel</li>
+  <li><code>!claiconfig &lt;key&gt; &lt;value&gt;</code> — Change a setting</li>
+  <li><code>!claireset</code> — Blow away compaction cache for this channel (next call rebuilds)</li>
+  <li><code>!claireset all</code> — Nuke entire cache DB</li>
+  <li><code>!claistatus</code> — Show cache state: age, messages covered, raw window size, model info</li>
+</ul>
+
+<div class="callout warn">
+  All config/admin commands are <code>@commands.is_owner()</code> only.
+</div>
+
+<h2>Flow</h2>
+
+<h3>First Call (Cold Cache)</h3>
+<ol>
+  <li>Check <code>ai_cache.db</code> for this channel — nothing there</li>
+  <li>Pull last <code>compact_days</code> of messages from Logger SQLite</li>
+  <li>Split at <code>raw_hours</code> boundary</li>
+  <li>Send older portion to <code>compact_model</code> with summarization prompt</li>
+  <li>Store summary in <code>compaction_cache</code> table</li>
+  <li>Send to <code>answer_model</code>: system prompt + summary + raw messages + question</li>
+</ol>
+
+<h3>Subsequent Calls (Warm Cache)</h3>
+<ol>
+  <li>Load cached summary from <code>ai_cache.db</code></li>
+  <li>Pull raw messages from cached <code>newest_snowflake</code> through now</li>
+  <li>Check if raw portion exceeds <code>recompact_raw_hours</code> threshold
+    <ul>
+      <li><strong>If no:</strong> Send to <code>answer_model</code>: system prompt + cached summary + raw messages + question</li>
+      <li><strong>If yes:</strong> Re-compact first (same as first call flow), then answer</li>
+    </ul>
+  </li>
+</ol>
+
+<h3>Cache Invalidation</h3>
+<ul>
+  <li><code>!claireset</code> — manual nuke</li>
+  <li>Re-compaction — automatic when raw window grows too large</li>
+  <li>Cache is keyed by <code>channel_id</code> — each channel is independent</li>
+</ul>
+
+<h2>Compaction Prompt</h2>
+<pre><code>Summarize the following Discord conversation concisely. Preserve:
+- Key facts, decisions, and conclusions
+- Important context about users and their preferences
+- Any ongoing topics or threads of discussion
+- Your own previous responses and positions (marked with [BOT])
+
+Omit:
+- Casual greetings, reactions, and small talk
+- Redundant back-and-forth
+- Messages with no informational value
+
+Keep the summary under {compact_max_tokens} tokens.</code></pre>
+
+<h2>What Doesn't Change <span class="tag tag-unchanged">unchanged</span></h2>
+<ul>
+  <li><code>!ai</code> and <code>!sai</code> (Gemini commands)</li>
+  <li><code>!chat</code> / <code>!newchat</code> (Gemini multi-turn)</li>
+  <li>Logger cog — read-only access, no modifications</li>
+  <li><code>config/config.py</code> — no new config entries needed</li>
+  <li>Safety settings, mention resolution, web search (<code>!sclai</code>)</li>
+</ul>
+
+<h2>Implementation Plan</h2>
+<ol>
+  <li>Add <code>ai_cache.py</code> helper module (DB init, cache CRUD, settings CRUD)</li>
+  <li>Modify <code>!clai</code> in <code>gemini.py</code> to use compacted context</li>
+  <li>Modify <code>!sclai</code> similarly</li>
+  <li>Add <code>!claiconfig</code>, <code>!claireset</code>, <code>!claistatus</code> commands</li>
+  <li>Test on a quiet channel first, then busy ones</li>
+</ol>
+
+<h2>Open Questions</h2>
+<div class="callout">
+  <ul style="margin-bottom:0">
+    <li>Should compaction summaries be <strong>cumulative</strong> (new summary builds on old summary + new messages) or <strong>full re-summarization</strong> each time?</li>
+    <li>Should <code>!sclai</code> web search results count toward token thresholds?</li>
+    <li>Worth adding a <code>!claicompact</code> command to manually trigger re-compaction without waiting for threshold?</li>
+  </ul>
+</div>
+
+<footer>
+  Generated from <a href="https://github.com/iamsix/palbot" style="color:var(--accent)">iamsix/palbot</a> design notes.
+</footer>
+
+</body>
+</html>
