@@ -84,10 +84,22 @@ Raw = verbatim messages from Logger DB</div>
   <strong>Why not cumulative?</strong> Cumulative summaries (feeding the old summary + new messages to produce an updated summary) drift over time. Each pass loses nuance, amplifies biases, and the summary gradually becomes a game of telephone. After a few cycles it'd be unrecognizable. Full re-summarization is more expensive per-compaction but keeps the summary grounded in actual messages.
 </div>
 
-<p><strong>Cost is manageable:</strong> Re-compaction only fires when the raw window exceeds <code>recompact_raw_hours</code> (default 12h). In a moderately active channel, that's maybe once or twice a day. One Sonnet call per re-compaction is cheap.</p>
+<p><strong>Cost is manageable:</strong> Re-compaction only fires when the raw window exceeds <code>recompact_raw_hours</code> (default 12h) or <code>recompact_raw_tokens</code> (default 15K) — whichever hits first. In a moderately active channel, that's maybe once or twice a day. One Sonnet call per re-compaction is cheap.</p>
 
-<h3>Re-compaction Trigger</h3>
-<p>As time passes, the raw window grows. When it exceeds a threshold (e.g. double <code>raw_hours</code> or a token limit), re-compaction fires:</p>
+<h3>Re-compaction Triggers</h3>
+<p>Re-compaction fires when <strong>either</strong> threshold is exceeded:</p>
+<ol>
+  <li><strong>Time-based:</strong> Raw window exceeds <code>recompact_raw_hours</code> (default 12h)</li>
+  <li><strong>Size-based:</strong> Raw window exceeds <code>recompact_raw_tokens</code> (default 15000 tokens)</li>
+</ol>
+
+<p>Whichever hits first wins. This prevents the case where a busy channel racks up 50K tokens of raw messages in 4 hours — time-based wouldn't catch it, but size-based does.</p>
+
+<div class="callout">
+  <strong>Skip compaction entirely</strong> if the raw window has fewer messages than would fit in <code>compact_max_tokens</code> — there's no point summarizing 800 tokens of chat into a 2000-token summary.
+</div>
+
+<p>When re-compaction fires:</p>
 <ol>
   <li>Pull the full <code>compact_days</code> window from Logger SQLite</li>
   <li>Split at <code>raw_hours</code> boundary</li>
@@ -95,6 +107,18 @@ Raw = verbatim messages from Logger DB</div>
   <li>New summary replaces the old one in cache</li>
   <li>Raw window shrinks back to <code>raw_hours</code></li>
 </ol>
+
+<h3>Error Handling</h3>
+<p>If the compaction API call fails (Sonnet timeout, rate limit, network error):</p>
+<ul>
+  <li><strong>During <code>!claireset</code>:</strong> Reply with the error. Cache stays deleted. Admin can retry.</li>
+  <li><strong>During auto re-compaction:</strong> Log the error, keep the old cache, skip compaction this round. Next <code>!clai</code> call will try again. The raw window keeps growing until compaction succeeds.</li>
+  <li><strong>During cold start:</strong> Reply with just the raw messages (no summary). Log the error. Next call retries.</li>
+</ul>
+
+<div class="callout warn">
+  Errors should be visible — don't silently swallow compaction failures. If an admin can see it broke, they can <code>!claireset</code> to retry.
+</div>
 
 <h2>Storage</h2>
 <p>New SQLite database created on first run at <code>logfiles/ai_cache.db</code>. Separate from the Logger DB (which has years of data and shouldn't be touched).</p>
@@ -129,7 +153,8 @@ CREATE TABLE settings (
   <tr><td><code>compact_days</code></td><td>7</td><td>How many days back to pull for compaction</td></tr>
   <tr><td><code>raw_hours</code></td><td>6</td><td>Minimum hours of uncompacted recent messages</td></tr>
   <tr><td><code>compact_max_tokens</code></td><td>2000</td><td>Target max size for compacted summary</td></tr>
-  <tr><td><code>recompact_raw_hours</code></td><td>12</td><td>Raw window size that triggers re-compaction</td></tr>
+  <tr><td><code>recompact_raw_hours</code></td><td>12</td><td>Time-based re-compaction trigger</td></tr>
+  <tr><td><code>recompact_raw_tokens</code></td><td>15000</td><td>Size-based re-compaction trigger (whichever hits first)</td></tr>
   <tr><td><code>search_max_tokens</code></td><td>8000</td><td>Max tokens for web search results (<code>!sclai</code> only)</td></tr>
 </table>
 
@@ -173,7 +198,7 @@ CREATE TABLE settings (
   <li><code>!claiconfig</code> — Show all current settings for this channel</li>
   <li><code>!claiconfig &lt;key&gt; &lt;value&gt;</code> — Change a setting</li>
   <li><code>!claireset</code> — Nuke cache and immediately rebuild (see below)</li>
-  <li><code>!claireset all</code> — Nuke entire cache DB and rebuild all channels on next use</li>
+  <li><code>!claireset all</code> — Nuke and rebuild all channels immediately</li>
   <li><code>!claistatus</code> — Server-wide usage stats + per-channel cache summary</li>
   <li><code>!claistatus #channel</code> — Detailed view for a specific channel</li>
 </ul>
@@ -265,18 +290,19 @@ Usage (last 7d / all time):
 <ol>
   <li>Load cached summary from <code>ai_cache.db</code></li>
   <li>Pull raw messages from cached <code>newest_snowflake</code> through now</li>
-  <li>Check if raw portion exceeds <code>recompact_raw_hours</code> threshold
+  <li>Check if raw portion exceeds either <code>recompact_raw_hours</code> or <code>recompact_raw_tokens</code>
     <ul>
       <li><strong>If no:</strong> Send to <code>answer_model</code>: system prompt + cached summary + raw messages + question</li>
       <li><strong>If yes:</strong> Re-compact first (full re-summarization), then answer</li>
     </ul>
   </li>
+  <li>Skip compaction entirely if raw tokens &lt; <code>compact_max_tokens</code> — no point summarizing into something bigger</li>
 </ol>
 
 <h3>Cache Invalidation</h3>
 <ul>
   <li><code>!claireset</code> — nuke and immediate rebuild</li>
-  <li>Re-compaction — automatic when raw window grows too large</li>
+  <li>Re-compaction — automatic when raw window exceeds time or token threshold</li>
   <li>Cache is keyed by <code>channel_id</code> — each channel is independent</li>
 </ul>
 
@@ -308,10 +334,11 @@ Keep the summary under {compact_max_tokens} tokens.</code></pre>
 
 <h2>Implementation Plan</h2>
 <ol>
-  <li>Add <code>ai_cache.py</code> helper module (DB init, cache CRUD, settings CRUD)</li>
+  <li>Add <code>ai_cache.py</code> helper module (DB init, cache CRUD, settings CRUD, usage logging)</li>
   <li>Modify <code>!clai</code> in <code>gemini.py</code> to use compacted context</li>
   <li>Modify <code>!sclai</code> similarly (with <code>search_max_tokens</code> cap)</li>
   <li>Add <code>!claiconfig</code>, <code>!claireset</code>, <code>!claistatus</code> commands</li>
+  <li>Add usage logging to all API call paths (answer, compaction)</li>
   <li>Test on a quiet channel first, then busy ones</li>
 </ol>
 
