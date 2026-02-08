@@ -353,12 +353,20 @@ Keep the summary under {compact_max_tokens} tokens.</code></pre>
 <h2>Implementation Plan</h2>
 <ol>
   <li>Add <code>ai_cache.py</code> helper module (DB init, cache CRUD, settings CRUD, usage logging)</li>
-  <li>Modify <code>!clai</code> in <code>gemini.py</code> to use compacted context</li>
-  <li>Modify <code>!sclai</code> similarly (with <code>search_max_tokens</code> cap)</li>
-  <li>Add <code>!claiconfig</code>, <code>!claireset</code>, <code>!claistatus</code> commands</li>
+  <li>Add <code>copilot.py</code> cog — moves <code>!clai</code>/<code>!sclai</code> out of <code>gemini.py</code>, adds compaction logic</li>
+  <li>Strip Copilot commands from <code>gemini.py</code> (keeps <code>!ai</code>, <code>!sai</code>, <code>!chat</code> only)</li>
+  <li>Add <code>!claiconfig</code>, <code>!claireset</code>, <code>!claistatus</code> commands in <code>copilot.py</code></li>
   <li>Add usage logging to all API call paths (answer, compaction)</li>
   <li>Test on a quiet channel first, then busy ones</li>
 </ol>
+
+<h3>File Structure</h3>
+<table>
+  <tr><th>File</th><th>Purpose</th></tr>
+  <tr><td><code>modules/copilot.py</code></td><td>New cog — all GitHub Copilot API commands (<code>!clai</code>, <code>!sclai</code>), compaction, admin commands. Model-agnostic (works with any Copilot model, not Claude-specific).</td></tr>
+  <tr><td><code>modules/ai_cache.py</code></td><td>New helper — SQLite DB for compaction cache, settings, usage tracking.</td></tr>
+  <tr><td><code>modules/gemini.py</code></td><td>Existing — trimmed to Gemini-only commands (<code>!ai</code>, <code>!sai</code>, <code>!chat</code>, <code>!newchat</code>). No Copilot code.</td></tr>
+</table>
 
 <h2>Resolved Decisions <span class="tag tag-resolved">resolved</span></h2>
 <table>
